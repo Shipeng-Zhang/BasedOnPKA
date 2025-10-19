@@ -23,17 +23,40 @@ class Logger(object):
         self.close()
 
     def write(self, msg):
-        self.console.write(msg)
+        try:
+            # write to original console (stdout)
+            if self.console is not None:
+                self.console.write(msg)
+        except Exception:
+            # ignore console write errors
+            pass
         if self.file is not None:
-            self.file.write(msg)
+            try:
+                self.file.write(msg)
+            except Exception:
+                # ignore file write errors to avoid crashing training
+                pass
 
     def flush(self):
-        self.console.flush()
+        try:
+            if self.console is not None:
+                self.console.flush()
+        except Exception:
+            pass
         if self.file is not None:
-            self.file.flush()
-            os.fsync(self.file.fileno())
+            try:
+                self.file.flush()
+                os.fsync(self.file.fileno())
+            except Exception:
+                pass
 
     def close(self):
-        self.console.close()
+        # Do NOT close the original console (sys.stdout). Closing sys.stdout
+        # can break the interactive session or further prints. Only close
+        # the file we opened for logging.
         if self.file is not None:
-            self.file.close()
+            try:
+                self.file.close()
+            except Exception:
+                pass
+            self.file = None

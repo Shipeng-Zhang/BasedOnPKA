@@ -1,4 +1,5 @@
 from __future__ import division, print_function, absolute_import
+import collections
 import os
 import copy
 from lreid_dataset.incremental_datasets import IncrementalPersonReIDSamples
@@ -17,47 +18,104 @@ class IncrementalSamples4market(IncrementalPersonReIDSamples):
     dataset_dir = 'market1501'  # 数据集的目录名称
     dataset_url = 'http://188.138.127.15:81/Datasets/Market-1501-v15.09.15.zip'  # 数据集下载 URL
 
-    def __init__(self, datasets_root, relabel=True, combineall=False):
+    def __init__(self, datasets_root, cam_filter, relabel=True, combineall=False):
         # 初始化方法，设置根目录、是否重新标记 ID 以及是否合并所有数据
+        self.global_pid2lable={}
+        self.next_pid_lable = 0
         self.relabel = relabel  # 是否重新标记 ID
         self.combineall = combineall  # 是否合并所有训练数据（包括查询和库）
         root = osp.join(datasets_root, self.dataset_dir, 'Market-1501-v15.09.15')  
+
         # 构建数据集的根路径
         self.train_dir = osp.join(root, 'bounding_box_train')  # 训练集目录
         self.query_dir = osp.join(root, 'query')  # 查询集目录
         self.gallery_dir = osp.join(root, 'bounding_box_test')  # 库集目录
-        train = self.process_dir(self.train_dir, relabel=True)  # 处理训练集，并重新标记 ID
-        query = self.process_dir(self.query_dir, relabel=False)  # 处理查询集，不重新标记 ID
+
+
+        self.check_before_run()
+        self.get_global_lable(self.train_dir) # 建立全局pid-lable映射
+
+        train, cam_num_classes = self.process_cam_dir(self.train_dir, cam_filter)  # 处理训练集，并重新标记 ID
+        query = self.process_dir(self.query_dir, cam_filter, relabel=False)  # 处理查询集，不重新标记 ID
         gallery = self.process_dir(self.gallery_dir, relabel=False)  # 处理库集，不重新标记 ID
-        self.train, self.query, self.gallery = train, query, gallery  # 将处理后的数据集赋值给类属性
+        self.train, self.query, self.gallery, self.num_classes = train, query, gallery, cam_num_classes  # 将处理后的数据集赋值给类属性
         self._show_info(train, query, gallery)  # 显示数据集的基本信息
 
-    def process_dir(self, dir_path, relabel=False):
+    def check_before_run(self):
+        """Check if all files are available before going deeper"""
+        if not osp.exists(self.train_dir):
+            raise RuntimeError("'{}' is not available".format(self.train_dir))
+        if not osp.exists(self.query_dir):
+            raise RuntimeError("'{}' is not available".format(self.query_dir))
+        if not osp.exists(self.gallery_dir):
+            raise RuntimeError("'{}' is not available".format(self.gallery_dir))
+    
+    def get_global_lable(self,train_dir):
+        cam_num = 6
+        img_paths = sorted(glob.glob(osp.join(train_dir,'*.jpg')))
+        pattern = re.compile(r'([-\d]+)_c(\d)')
+        for cam_idx in range(cam_num):
+            for img_path in img_paths:
+                pid,camid = map(int,pattern.search(img_path).groups())
+                if pid <= 0:
+                    continue
+                camid -= 1
+                if camid != cam_idx:
+                    continue
+                if pid not in self.global_pid2lable:
+                    self.global_pid2lable[pid] = self.next_pid_lable
+                    self.next_pid_lable += 1
+
+
+        
+
+    def process_dir(self, dir_path, cam_filter=None, relabel=False):
         # 处理数据集文件夹中的图像，并返回包含图像路径、行人 ID 和摄像头 ID 的列表
-        img_paths = glob.glob(osp.join(dir_path, '*.jpg'))  # 获取文件夹中所有图片的路径
+        img_paths = sorted(glob.glob(osp.join(dir_path, '*.jpg')))  # 获取文件夹中所有图片的路径
         pattern = re.compile(r'([-\d]+)_c(\d)')  # 定义用于提取行人 ID 和摄像头 ID 的正则表达式
-
-        pid_container = set()  # 创建一个集合，用于存储所有行人 ID
-        for img_path in img_paths:
-            pid, _ = map(int, pattern.search(img_path).groups())  # 从图片文件名中提取行人 ID 和摄像头 ID
-            if pid == -1:
-                continue  # 忽略垃圾图像（行人 ID 为 -1）
-            pid_container.add(pid)  # 将行人 ID 添加到集合中
-        pid2label = {pid: label for label, pid in enumerate(pid_container)}  # 为每个行人 ID 分配一个新的标签（从 0 开始）
-
         data = []  # 用于存储处理后的图像数据
         for img_path in img_paths:
             pid, camid = map(int, pattern.search(img_path).groups())  # 提取图片的行人 ID 和摄像头 ID
-            if pid == -1:
+            if pid <= 0:
                 continue  # 忽略垃圾图像
-            assert 0 <= pid <= 1501  # 确保行人 ID 合法（0 表示背景，1-1501 为有效行人 ID）
-            assert 1 <= camid <= 6  # 确保摄像头 ID 合法（1-6 表示有效摄像头）
+            # if pid in self.global_pid2lable:
+            #     pid = self.global_pid2lable[pid]
             camid -= 1  # 摄像头 ID 从 0 开始计数
-            if relabel:
-                pid = pid2label[pid]  # 如果需要重新标记 ID，则使用新的标签替换原 ID
-            data.append((img_path, pid, camid, 0))  # 将图像路径、行人 ID、摄像头 ID 以及第 4 列的数据（0）添加到列表中
+            if cam_filter is not None:
+                if camid == cam_filter:
+                    data.append((img_path, pid, camid, 0))  # 将图像路径、行人 ID、摄像头 ID 以及第 4 列的数据（0）添加到列表中
+            else:
+                data.append((img_path,pid,camid,0))
 
         return data  # 返回处理后的图像数据
+
+    def process_cam_dir(self, dir_path, cam_filter):
+        cam_num = 6
+        img_paths = sorted(glob.glob(osp.join(dir_path, '*.jpg')))
+        pattern = re.compile(r'([-\d]+)_c(\d)')
+
+        datasets = collections.defaultdict(list)
+        cam_num_classes = [] # 统计每个相机的类别数
+
+        for cam_idx in range(cam_num):
+            dataset = []
+            pids = set()
+            for img_path in img_paths:
+                pid, camid = map(int, pattern.search(img_path).groups())
+                if pid <= 0:
+                    continue  # junk images are just ignored
+                camid -= 1  # index starts from 0
+                if camid!=cam_idx:
+                    continue
+                pid = self.global_pid2lable[pid]
+
+                dataset.append((img_path, pid, camid, 0))
+                pids.add(pid)
+
+            datasets[cam_idx] = dataset
+            cam_num_classes.append(len(pids))
+
+        return datasets[cam_filter],cam_num_classes[cam_filter]
 
 
 

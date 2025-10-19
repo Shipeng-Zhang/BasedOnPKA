@@ -180,28 +180,37 @@ class RandomMultipleGallerySampler(Sampler):
 
             ret.append(i)  # 添加该索引到返回结果中
 
-            pid_i = self.index_pid[i]  # 获取当前索引对应的身份ID
-            cams = self.pid_cam[pid_i]  # 获取该身份对应的所有摄像头ID
-            index = self.pid_index[pid_i]  # 获取该身份对应的所有数据索引
-            select_cams = No_index(cams, i_cam)  # 获取该身份其他摄像头ID
-
-            if select_cams:
-                # 如果有其他摄像头ID，从中随机选取（num_instances - 1）个
-                if len(select_cams) >= self.num_instances:
-                    cam_indexes = np.random.choice(select_cams, size=self.num_instances-1, replace=False)
-                else:
-                    cam_indexes = np.random.choice(select_cams, size=self.num_instances-1, replace=True)
-                for kk in cam_indexes:
-                    ret.append(index[kk])  # 将选中的索引添加到返回结果中
-            else:
-                # 如果没有其他摄像头ID，随机选择其他索引
-                select_indexes = No_index(index, i)
-                if not select_indexes: continue  # 如果没有可选的其他索引，跳过
-                if len(select_indexes) >= self.num_instances:
-                    ind_indexes = np.random.choice(select_indexes, size=self.num_instances-1, replace=False)
-                else:
-                    ind_indexes = np.random.choice(select_indexes, size=self.num_instances-1, replace=True)
-                for kk in ind_indexes:
-                    ret.append(index[kk])  # 将选中的索引添加到返回结果中
-
+            index = self.pid_index[i_pid]  # 获取该身份对应的所有数据索引
+            same_cam_indexes = [idx for idx in index if self.data_source[idx][2] == i_cam]
+            same_cam_indexes = [idx for idx in same_cam_indexes if idx != i]
+            if not same_cam_indexes:
+                same_cam_indexes = [i]
+            
+            # 采样num_instance-1张
+            chosen_idxs = np.random.choice(
+                same_cam_indexes,
+                size = self.num_instances - 1,
+                replace = len(same_cam_indexes) < self.num_instances - 1
+            )
+            ret.extend(chosen_idxs)
+        # End for: return iterator over the full list
         return iter(ret)  # 返回索引的迭代器
+
+            # if select_cams:
+            #     # 如果有其他摄像头ID，从中随机选取（num_instances - 1）个
+            #     if len(select_cams) >= self.num_instances:
+            #         cam_indexes = np.random.choice(select_cams, size=self.num_instances-1, replace=False)
+            #     else:
+            #         cam_indexes = np.random.choice(select_cams, size=self.num_instances-1, replace=True)
+            #     for kk in cam_indexes:
+            #         ret.append(index[kk])  # 将选中的索引添加到返回结果中
+            # else:
+            #     # 如果没有其他摄像头ID，随机选择其他索引
+            #     select_indexes = No_index(index, i)
+            #     if not select_indexes: continue  # 如果没有可选的其他索引，跳过
+            #     if len(select_indexes) >= self.num_instances:
+            #         ind_indexes = np.random.choice(select_indexes, size=self.num_instances-1, replace=False)
+            #     else:
+            #         ind_indexes = np.random.choice(select_indexes, size=self.num_instances-1, replace=True)
+            #     for kk in ind_indexes:
+            #         ret.append(index[kk])  # 将选中的索引添加到返回结果中

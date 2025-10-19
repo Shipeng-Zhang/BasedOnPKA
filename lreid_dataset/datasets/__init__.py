@@ -48,7 +48,7 @@ def names():
     return sorted(__factory.keys())
 
 
-def create(name, root, *args, **kwargs):
+def create(name, cam_filter, root, *args, **kwargs):
     """
     Create a dataset instance.
 
@@ -69,7 +69,7 @@ def create(name, root, *args, **kwargs):
     """
     if name not in __factory:
         raise KeyError("Unknown dataset:", name)
-    return __factory[name](root, *args, **kwargs)
+    return __factory[name](root, cam_filter, *args, **kwargs)
 
 
 def get_dataset(name, root, *args, **kwargs):

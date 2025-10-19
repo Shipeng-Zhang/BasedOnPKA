@@ -20,9 +20,9 @@ class IterLoader:
     
     def next(self):
         try:
-            #print("Fetching next batch")  # 调试信息
+            # print("Fetching next batch")  # 调试信息
             return next(self.iter)
         except:
-            #print("Restarting iterator")  # 调试信息
+            # print("Restarting iterator")  # 调试信息
             self.iter = iter(self.loader)
             return next(self.iter)

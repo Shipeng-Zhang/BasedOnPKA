@@ -68,9 +68,16 @@ def initial_classifier(model, data_loader):
     features_all, labels_all, fnames_all, camids_all = extract_features(model, data_loader)
     for feature, pid in zip(features_all, labels_all):
         pid2features[pid].append(feature)
-    class_centers = [torch.stack(pid2features[pid]).mean(0) for pid in sorted(pid2features.keys())]
-    class_centers = torch.stack(class_centers)
-    return F.normalize(class_centers, dim=1).float().cuda()
+
+    # 计算每个ID的类中心 (返回dict: {global_pid: center})
+    centers = {}
+    for pid, feats in pid2features.items():
+        center = torch.stack(feats).mean(0)
+        centers[pid] = F.normalize(center, dim=0).float().cuda()
+    return centers
+    # class_centers = [torch.stack(pid2features[pid]).mean(0) for pid in sorted(pid2features.keys())]
+    # class_centers = torch.stack(class_centers)
+    # return F.normalize(class_centers, dim=1).float().cuda()
 
 def obtain_voronoi_loader(dataset,new_labels, add_num=0, batch_size = 32,num_instance=4,workers=8):
     normalizer = T.Normalize(mean=[0.485, 0.456, 0.406],

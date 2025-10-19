@@ -10,6 +10,107 @@ import numpy as np
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.distributions.multivariate_normal import MultivariateNormal
+from torch.distributions import Normal, Independent
+
+class ETF_Classifier(nn.Module):
+    """
+    基于 Simplex ETF 的分类头
+    - feature_dim: 输入特征的维度
+    - num_classes: 分类的类别数
+    - LWS: 是否使用 LWS 技术Learned Weight Scaling--每个类的尺度可学习
+    - reg_ETF: 预留是否对 ETF 做正则
+    该分类器使用 ETF 权重矩阵进行分类，权重矩阵在初始化时被设置为不可训练参数。
+    通过前向传播计算输入特征与 ETF 权重矩阵的点积，得到分类得分。
+    """
+    def __init__(self, feature_dim, num_classes,LWS=False, reg_ETF=False,device=None):
+        super(ETF_Classifier, self).__init__()
+        self.feature_dim = feature_dim
+        self.num_classes = num_classes
+        self.LWS = LWS
+        self.reg_ETF = reg_ETF
+
+        # 生成随机正交矩阵 P (d x C)
+        P = self.generate_random_orthogonal_matrix(feature_dim, num_classes)
+        I = torch.eye(num_classes)
+        one = torch.ones((num_classes, num_classes))
+
+        # 构造 ETF 矩阵 M = sqrt(C/(C-1)) * P @ (I - 1/C * 11^T)
+        M = math.sqrt(num_classes / (num_classes - 1.0)) * torch.matmul (P,(I - one / num_classes)) 
+        # 把 M 注册为 buffer（随 module 一起移动到 device，但不参与优化）
+        self.register_buffer('ori_M', M)  # shape: (d, C)
+        if self.LWS:
+            # learned scaling per-class (初始化为接近 1 的小随机量)
+            # 我们用 alpha 经过 softmax 再乘 C 得到每个类的 scale
+            self.alpha = nn.Parameter(1e-3 * torch.randn(1,num_classes))
+        else:
+            # 非 LWS 使用固定的 ones（注册为 buffer 以便移动设备）
+            self.register_buffer('fixed_scale', torch.ones(1, num_classes))
+
+    def generate_random_orthogonal_matrix(self, feature_dim, num_classes):
+        # 生成一个随机矩阵
+        a = np.random.randn(feature_dim, num_classes).astype(np.float32)
+        P, _ = np.linalg.qr(a) 
+        P = torch.from_numpy(P).float()
+
+        return P
+
+    def expand_etf(self, old_M, feature_dim, num_new_classes):
+        """
+        old_M: [feature_dim, old_num_classes]
+        """
+        old_num_classes = old_M.size(1)
+        num_classes_total = old_num_classes + num_new_classes
+        device = old_M.device
+
+        # 生成随机新列
+        new_M_random = torch.from_numpy(np.random.randn(feature_dim, num_new_classes).astype(np.float32)).to(device)
+
+        # 正交化新列，与旧列正交
+        P_old = old_M @ old_M.T
+        new_M = new_M_random - P_old @ new_M_random
+
+        # 对每一列归一化
+        new_M = torch.nn.functional.normalize(new_M, p=2, dim=0)
+
+        # ETF缩放
+        I_new = torch.eye(num_new_classes, device=device)
+        one_new = torch.ones((num_new_classes, num_new_classes),device=device)
+        new_M = math.sqrt(num_classes_total / (num_classes_total - 1.0)) * new_M @ (I_new - one_new / num_new_classes)
+
+        # 拼接新列和旧列
+        expanded_M = torch.cat([old_M,new_M], dim=1)
+
+        return expanded_M
+
+
+    def forward(self, x):
+        """
+        输入:
+            x: features, shape (N, d)
+        输出:
+            logits: shape (N, C)
+        说明:
+            - 对输入做 L2 归一化（保证在单位球面）
+            - 计算 logits = x @ M （如果 LWS 则对 M 的列按类尺度缩放）
+        """
+        # 确保 x 是二维 (N, d)
+        assert x.dim() == 2 and x.size(1) == self.feature_dim, f"Expected input (N,{self.feature_dim}), got {tuple(x.shape)}"
+
+        # L2 归一化输入特征（避免外部没有归一化）
+        x_norm = F.normalize(x, p=2, dim=1, eps=1e-8)  # (N, d)
+
+        M = self.ori_M  # (d, C)
+
+        # 应用 LWS 缩放（如果选用）
+        if self.LWS:
+            # softmax alpha -> scale in (0, C) 类似之前注释掉的策略
+            scale = F.softmax(self.alpha, dim=-1) * self.num_classes  # (1, C)
+            logits = torch.matmul(x_norm, M * scale)  # broadcasting (d,C)*(1,C) -> (d,C)
+        else:
+            logits = torch.matmul(x_norm, M)  # (N, C)
+
+        return logits
+
 
 class GeneralizedMeanPooling(nn.Module):
     r"""应用2D幂平均自适应池化到由多个输入平面组成的输入信号上。
@@ -91,8 +192,9 @@ class ResNetSimCLR(nn.Module):
         nn.init.constant_(self.bottleneck.weight, 1)  # 初始化权重为1
         nn.init.constant_(self.bottleneck.bias, 0)  # 初始化偏置为0
 
-        self.classifier = nn.Linear(out_dim, num_classes, bias=False)  # 分类器
-        nn.init.normal_(self.classifier.weight, std=0.001)  # 初始化分类器权重
+        self.classifier = ETF_Classifier(out_dim, num_classes, LWS=False, reg_ETF=False)  # 分类器
+        # self.classifier = nn.Linear(out_dim, num_classes, bias=False)  # 分类器
+        # nn.init.normal_(self.classifier.weight, std=0.001)  # 初始化分类器权重
         self.relu = nn.ReLU()  # 激活函数
 
     def _get_basemodel(self, model_name):
@@ -202,9 +304,10 @@ class ResNetSimCLR(nn.Module):
             BS_current, D = s_features.size()  # 获取当前批次大小和特征维度
             # 创建多变量正态分布，均值为s_features，协方差矩阵的对角线为out_var (解释为每个维度的方差或标准差的平方)
             # torch.diag_embed(out_var) 创建一个对角矩阵，对角线元素是 out_var 的值
-            tdist = MultivariateNormal(loc=s_features, scale_tril=torch.diag_embed(out_var))
+            std = torch.sqrt(F.softplus(out_var) + 1e-8)
+            tdist = Independent(Normal(loc=s_features, scale=std), 1)
             samples = tdist.rsample(self.n_samples)  # 从分布中进行可重参数化采样，形状 (n_samples, BS_current, D)
-            samples = self.l2norm_sample(samples)  # 对采样的特征进行L2归一化，在第2维上 (特征维度)
+            samples = F.normalize(samples, p=2, dim=-1, eps=1e-8)  # 对采样的特征进行L2归一化，在第2维上 (特征维度)
 
             # 将归一化的均值特征 (s_features) 与归一化的采样特征 (samples) 合并
             # s_features.unsqueeze(0) 形状 (1, BS_current, D)

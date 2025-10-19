@@ -1,5 +1,6 @@
 from __future__ import print_function, absolute_import
 import argparse
+import math
 import os
 import os.path as osp
 import sys
@@ -20,12 +21,19 @@ from reid.utils.serialization import load_checkpoint, save_checkpoint, copy_stat
 from reid.utils.lr_scheduler import WarmupMultiStepLR
 from reid.utils.feature_tools import *
 from reid.models.layers import DataParallel
-from reid.models.resnet_uncertainty import ResNetSimCLR
+from reid.models.resnet_uncertainty import ResNetSimCLR, ETF_Classifier
 from reid.trainer import Trainer
 from torch.utils.tensorboard import SummaryWriter
 
 from lreid_dataset.datasets.get_data_loaders import build_data_loaders
 from tools.Logger_results import Logger_res
+import os
+import warnings
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+warnings.filterwarnings("ignore")
+
+cam_num = 6
 def main():
     args = parser.parse_args()
 
@@ -42,14 +50,20 @@ def main():
 
     main_worker(args)
 
-
+# 主函数
 def main_worker(args):
+
     log_name = 'log.txt'
     if not args.evaluate:#训练模式
-        sys.stdout = Logger(osp.join(args.logs_dir, log_name))
+        logger_obj = Logger(osp.join(args.logs_dir, log_name))
+        sys.stdout = logger_obj
+        # also redirect stderr to the same logger so errors/tqdm-like outputs are captured
+        sys.stderr = logger_obj
     else:#测试模式
         log_dir = osp.dirname(args.test_folder)
-        sys.stdout = Logger(osp.join(log_dir, log_name))
+        logger_obj = Logger(osp.join(log_dir, log_name))
+        sys.stdout = logger_obj
+        sys.stderr = logger_obj
     print("==========\nArgs:{}\n==========".format(args))
     log_res_name='log_res.txt'
     logger_res=Logger_res(osp.join(args.logs_dir, log_res_name))    # record the test results
@@ -58,34 +72,32 @@ def main_worker(args):
     """
     loading the datasets:
     setting： 1 or 2 
-    """
-    if 1 == args.setting:
-        training_set = ['market1501','cuhk_sysu','dukemtmc','msmt17','cuhk03']
-        #,'cuhk_sysu','cuhk03'
-    else:
-        training_set = ['market1501','dukemtmc', 'msmt17']
-        #, 'cuhk_sysu', 'cuhk03'
-        #
-    # all the revelent datasets
-        
-    all_set = ['market1501','sense','prid', 'dukemtmc', 'msmt17',
-    'cuhk01','cuhk02']  #        
-    # the datsets only used for testing 'grid', 'viper','cuhk03','cuhk_sysu',
-    testing_only_set = [x for x in all_set if x not in training_set]
+    # """
+    # if 1 == args.setting:
+    #     training_set = ['market1501','cuhk_sysu','dukemtmc','msmt17','cuhk03']
+    #     #,'cuhk_sysu','cuhk03'
+    # else:
+    #     training_set = ['market1501','dukemtmc', 'msmt17']
+    #     #, 'cuhk_sysu', 'cuhk03'
+    #     #
+    # # all the revelent datasets
+    
+    training_set = [f'market1501_cam{i}' for i in range(cam_num)]
+    all_testing_set = training_set      
      
     # get the loders of different datasets
-    all_train_sets, all_test_only_sets = build_data_loaders(args, training_set, testing_only_set)    
+    # 返回[dataset,num_classes,train_loader,test_loader,init_loader,name,train_img_count]
+    all_train_sets, all_test_only_sets = build_data_loaders(args, training_set, all_testing_set)   
     
     first_train_set = all_train_sets[0]
     print('len training_set',len(training_set))
-    print('len testing_only_set',len(testing_only_set))
 
     # 使用实际映射后的设备编号
-    device_ids = [0,1]  # 逻辑设备 ID 对应物理 GPU 4, 5, 6, 7
+    device_ids = [0,1,2,3]  # 逻辑设备 ID 对应物理 GPU 4, 5, 6, 7
 
-    # 伪映射逻辑：将逻辑设备映射到物理设备
-    logical_device_map = {0:0,1:1}  # 映射关系
-    main_device = torch.device(f'cuda:{logical_device_map[device_ids[0]]}')  # 主 GPU 对应物理 4
+    # # 伪映射逻辑：将逻辑设备映射到物理设备
+    # logical_device_map = {0:0,1:1}  # 映射关系
+    # main_device = torch.device(f'cuda:{logical_device_map[device_ids[0]]}')  # 主 GPU 对应物理 4
 
     main_device = torch.device(f'cuda:{device_ids[0]}')  # 主 GPU 设置为 4 号显卡
     model=ResNetSimCLR(num_classes=first_train_set[1], uncertainty=True,n_sampling=args.n_sampling)
@@ -98,7 +110,7 @@ def main_worker(args):
     writer = SummaryWriter(log_dir=args.logs_dir)
     # Load from checkpoint
     '''test the models under a folder'''
-    if args.test_folder:
+    if args.test_folder:  # 测试模式
         ckpt_name = [x + '_checkpoint.pth.tar' for x in training_set]   # obatin pretrained model name
         checkpoint = load_checkpoint(osp.join(args.test_folder, ckpt_name[0]))  # load the first model
         copy_state_dict(checkpoint['state_dict'], model)     #    
@@ -121,7 +133,7 @@ def main_worker(args):
     
 
     # resume from a model
-    if args.resume:
+    if args.resume: # 恢复模式
         checkpoint = load_checkpoint(args.resume)
         copy_state_dict(checkpoint['state_dict'], model)
         start_epoch = checkpoint['epoch']
@@ -135,31 +147,40 @@ def main_worker(args):
         raise AssertionError(f"the model {args.MODEL} is not supported!")
     
     proto_type={}
+    global_proto_type = {}
     # train on the datasets squentially
     for set_index in range(0, len(training_set)):       
         model_old = copy.deepcopy(model)
-        model= train_dataset(args, proto_type,all_train_sets, all_test_only_sets, set_index, model, out_channel,
+        model= train_dataset(args, proto_type,global_proto_type,all_train_sets, all_test_only_sets, set_index, model, out_channel,
                                             writer,logger_res=logger_res)
-        #test_model(model, all_train_sets, all_test_only_sets, set_index, logger_res=logger_res)
+        if set_index == 0:
+            features_all,labels_all,features_mean,labels_named = obtain_types(all_train_sets,set_index,global_proto_type,model)
+            global_proto_type = update_proto_types(global_proto_type,features_all,labels_all,momentum=0.5)
+
+            # test_model(model, all_train_sets, all_test_only_sets, set_index, logger_res=logger_res)
 
         if set_index>0:
-            add_num = sum([all_train_sets[i][1] for i in range(set_index)])  # get model out_dim
             dataset, num_classes, train_loader, test_loader, init_loader, name,pic_num = all_train_sets[set_index]  # status of current dataset
 
             pic_num_total = sum([all_train_sets[i][6] for i in range(set_index)])  # get model out_dim
-            print(f"pic_num: {pic_num}")
-            print(f"pic_num_total: {pic_num_total}")
+            print(f"pic_num(新训练集的数量): {pic_num}")
+            print(f"pic_num_total(之前所有训练集的数量): {pic_num_total}")
             alpha = pic_num / pic_num_total  # calculate the alpha for linear combination
             model=linear_combination(args, model, model_old, alpha)  
-            #test_model(model, all_train_sets, all_test_only_sets, set_index, logger_res=logger_res)    
+
+            features_all,labels_all,features_mean,labels_named = obtain_types(all_train_sets,set_index,global_proto_type,model)
+            global_proto_type = update_proto_types(global_proto_type,features_all,labels_all,momentum=0.5)
+
+            test_model(model, all_train_sets, all_test_only_sets, set_index, logger_res=logger_res)    
     print('finished')
 
 
-def obtain_old_types( all_train_sets, set_index, model):
-    dataset_old, num_classes_old, train_loader_old, _, init_loader_old, name_old,pic_num = all_train_sets[set_index - 1]  # trainloader of old dataset
+def obtain_types( all_train_sets, set_index, global_proto_type, model):
+    dataset_old, num_classes_old, train_loader_old, _, init_loader_old, name_old,pic_num = all_train_sets[set_index]  # trainloader of old dataset
     features_all_old, labels_all_old, fnames_all, camids_all, features_mean, labels_named= extract_features_uncertain(model,
                                                                                                                   init_loader_old,
-                                                                                                                  get_mean_feature=True)  # init_loader is original designed for classifer init
+                                                                                                                  get_mean_feature=True)  # init_loader is original designed for classifer ini
+   
     #, vars_mean,vars_all 
     features_all_old = torch.stack(features_all_old)
     labels_all_old = torch.tensor(labels_all_old).to(features_all_old.device)
@@ -167,10 +188,11 @@ def obtain_old_types( all_train_sets, set_index, model):
     return features_all_old, labels_all_old, features_mean, labels_named#,vars_mean,vars_all
 
 
-def train_dataset(args, proto_type,all_train_sets, all_test_only_sets, set_index, model, out_channel, writer,logger_res=None):
+# 主要训练过程
+def train_dataset(args, proto_type,global_proto_type,all_train_sets, all_test_only_sets, set_index, model, out_channel, writer,logger_res=None):
     if set_index>0:
-        features_all_old, labels_all_old,features_mean, labels_named=obtain_old_types( all_train_sets,set_index,model)
-        proto_type={}
+        features_all_old, labels_all_old,features_mean, labels_named=obtain_types(all_train_sets,set_index-1,global_proto_type,model) # 旧原型特征
+
         #,vars_mean,vars_all
         proto_type[set_index-1]={
                 "features_all_old":features_all_old,
@@ -181,63 +203,45 @@ def train_dataset(args, proto_type,all_train_sets, all_test_only_sets, set_index
                 #"vars_all":vars_all
         }
     else:
-        proto_type=None
-        dataset, num_classes, train_loader, test_loader, init_loader, name,picnum= all_train_sets[set_index]  # status of current dataset    
-
+        proto_type = None
+    dataset, num_classes, train_loader, test_loader, init_loader, name,picnum= all_train_sets[set_index]  # status of current dataset    
     Epochs= args.epochs0 if 0==set_index else args.epochs
-    dataset, num_classes, train_loader, test_loader, init_loader, name,picnum= all_train_sets[set_index]  # status of current dataset
 
-    Epochs= args.epochs0 if 0==set_index else args.epochs          
-
-    if set_index<1:
-        add_num = 0
-        old_model=None
-    else:
-        add_num = sum(
-            [all_train_sets[i][1] for i in range(set_index - 1)])  # get person number in existing domains
-        #print('add_num',add_num)
+    print('####### starting training on {} #######'.format(name))
+       
     
+    # global_pid_set 只初始化一次
+    if not hasattr(train_dataset, "global_pid_set"):
+        train_dataset.global_pid_set = set()
+
+    current_pids = {pid for _, pid, _, _ in dataset.train}
+    new_pids = [pid for pid in current_pids if pid not in train_dataset.global_pid_set]
+    train_dataset.global_pid_set.update(new_pids)
+    num_new_classes = len(new_pids)  
+    if set_index == 0: 
+        old_model = None
     if set_index>0:
         '''store the old model'''
         old_model = copy.deepcopy(model)
         old_model = old_model.cuda()
         old_model.eval()
 
-        # after sampling rehearsal, recalculate the addnum(historical ID number)
-        add_num = sum([all_train_sets[i][1] for i in range(set_index)])  # get model out_dim
-
         pic_num = sum([all_train_sets[i][6] for i in range(set_index)])
-        print(f"add_num: {add_num}")
-        print(f"pic_num: {pic_num}")
-        print('num_classes =' , num_classes)
+        print(f"add_num(增加的新类别): {num_new_classes}")
+        print(f"pic_num(之前的训练集数量): {pic_num}")
+        print('num_classes(现在集合的类别数) =' , num_classes)
 
         # Expand the dimension of classifier
-        org_classifier_params = model.module.classifier.weight.data
+        old_M = model.module.classifier.ori_M.data
+        feature_dim = old_M.size(0)
+        old_num_classes = old_M.size(1)
+        num_classes_total = len(train_dataset.global_pid_set)
+        num_new_classes = num_classes_total - old_num_classes
 
-        # 打印 org_classifier_params 的 shape
-        print(f"Original classifier params shape: {org_classifier_params.shape}")
-
-        model.module.classifier = nn.Linear(out_channel, add_num + num_classes, bias=False)
-
-        # 打印新的 classifier 的 shape
-        print(f"New classifier weight shape: {model.module.classifier.weight.data.shape}")
-
-        # 将原有的参数复制到新的 classifier
-        model.module.classifier.weight.data[:add_num].copy_(org_classifier_params)
-        model.cuda()
-
-        # Initialize classifier with class centers
-        class_centers = initial_classifier(model, init_loader)
-
-        # 打印 class_centers 的 shape
-        print(f"Class centers shape: {class_centers.shape}")
-
-        # 打印 add_num 之后的 classifier weight 的 shape
-        print(f"Classifier weight shape after add_num: {model.module.classifier.weight.data[add_num:].shape}")
-
-        # 将 class_centers 的值复制到 classifier 对应大小的位置
-        model.module.classifier.weight.data[add_num:add_num + class_centers.shape[0]].copy_(class_centers)
-
+        if num_new_classes > 0:
+            expanded_M = model.module.classifier.expand_etf(old_M, feature_dim, num_new_classes)
+            model.module.classifier.ori_M = expanded_M
+            model.module.classifier.num_classes = num_classes_total
         model.cuda()
 
 
@@ -255,15 +259,19 @@ def train_dataset(args, proto_type,all_train_sets, all_test_only_sets, set_index
     Stones = [20, 30] if name == 'msmt17' else args.milestones
     lr_scheduler = WarmupMultiStepLR(optimizer, Stones, gamma=0.1, warmup_factor=0.01, warmup_iters=args.warmup_step)
     
-  
+    # 添加冻结BN层部分
+    for m in model.modules():
+        if isinstance(m, torch.nn.BatchNorm1d) or isinstance(m, torch.nn.BatchNorm2d):
+            m.eval()
+            m.track_running_stats = False
+
     trainer = Trainer(args, model, old_model, writer=writer)
 
-    print('####### starting training on {} #######'.format(name))
     for epoch in range(0, Epochs):#epoch
-        train_loader.new_epoch()
 
-        trainer.train(epoch, train_loader,  optimizer, training_phase=set_index + 1,
-                      proto_type=proto_type,train_iters=len(train_loader), add_num=add_num
+        train_loader.new_epoch()
+        trainer.train(epoch, train_loader,  optimizer, training_phase=set_index + 1,proto_type = proto_type,
+                      global_proto_type=global_proto_type,train_iters=len(train_loader), add_num=0
                       )
  
         lr_scheduler.step()       
@@ -291,6 +299,7 @@ def train_dataset(args, proto_type,all_train_sets, all_test_only_sets, set_index
     return model
 
 
+# 检验模型性能
 def test_model(model, all_train_sets, all_test_sets, set_index,  logger_res=None):
     begin = 0
     evaluator = Evaluator(model)
@@ -317,7 +326,7 @@ def test_model(model, all_train_sets, all_test_sets, set_index,  logger_res=None
     mAP_all = []
     names_unseen = ''
     Results_unseen = ''
-    for i in range(len(all_test_sets)):
+    for i in range(set_index + 1,cam_num):
         dataset, num_classes, train_loader, test_loader, init_loader, name,pic_num = all_test_sets[i]
         print('Results on {}'.format(name))
         R1, mAP = evaluator.evaluate(test_loader, dataset.query, dataset.gallery,
@@ -354,6 +363,7 @@ def test_model(model, all_train_sets, all_test_sets, set_index,  logger_res=None
     return train_mAP
 
 
+# 可视化
 def visualize_tsne_for_ids(all_train_sets, model, device, save_dir='/data1/lzj_log/COPY', num_ids=5):
     """
     从五个训练集中随机抽取 num_ids 个 ID，将这些 ID 的所有样本（来自训练集 train_loader） 
@@ -463,8 +473,11 @@ def visualize_tsne_for_ids(all_train_sets, model, device, save_dir='/data1/lzj_l
     plt.close()
     print(f"t-SNE visualization saved to {save_path}")
 
-
+# 模型参数融合
 def linear_combination(args, model, model_old, alpha, model_old_id=-1):
+    """
+    仅融合 backbone 参数，跳过 ETF 分类器的 ori_M
+    """
     '''old model '''
     model_old_state_dict = model_old.state_dict()
     '''latest trained model'''
@@ -474,7 +487,12 @@ def linear_combination(args, model, model_old, alpha, model_old_id=-1):
     model_new_state_dict = model_new.state_dict()
     '''fuse the parameters'''
     for k, v in model_state_dict.items():
-        if model_old_state_dict[k].shape == v.shape:
+        # 跳过 ETF 分类器的相关参数
+        if "classifier.ori_M" in k or "classifer" in k:
+            model_new_state_dict[k] = v
+            continue
+        #正常融合backbone
+        if k in model_old_state_dict and model_old_state_dict[k].shape == v.shape:
             # print(k,'+++')
                 model_new_state_dict[k] = alpha * v + (1 - alpha) * model_old_state_dict[k]
         else:
@@ -483,6 +501,39 @@ def linear_combination(args, model, model_old, alpha, model_old_id=-1):
             model_new_state_dict[k][:num_class_old] = alpha * v[:num_class_old] + (1 - alpha) * model_old_state_dict[k]
     model_new.load_state_dict(model_new_state_dict)
     return model_new
+
+    
+def update_proto_types(global_proto_type,features,labels,momentum=0.5):
+    """
+    features:Tensor [N,D]当前batch的特征
+    labels:Tensor[N]当前batch的ID
+    global_proto_type:dict,全局原型字典
+    """
+    device = features.device
+    labels = labels.reshape(-1).to(device)
+
+    unique_labels = labels.unique()
+    for uid in unique_labels:
+        uid_int = int(uid.item())
+        mask = (labels == uid)
+        batch_proto = features[mask].mean(dim=0,keepdim=True).detach() # shape[D]
+        if uid_int in global_proto_type:
+            # momentum 更新
+            old_proto = global_proto_type[uid_int]["mean_features"]
+            old_count = int(global_proto_type[uid_int].get("count",0))
+            new_proto = momentum * old_proto + (1 - momentum) * batch_proto
+            new_count = old_count + 1
+            global_proto_type[uid_int]["mean_features"] = F.normalize(new_proto, p=2, dim=1).detach()
+            global_proto_type[uid_int]["count"] = new_count
+        else:
+            # 如果是新ID，直接存进去
+            global_proto_type[uid_int] = {
+                "mean_features": F.normalize(batch_proto, p=2, dim=1).detach(),
+                "count": 1
+            }
+
+    print(f"当前全局原型个数：{len(global_proto_type)}")
+    return global_proto_type
 
 
 if __name__ == '__main__':
@@ -508,23 +559,23 @@ if __name__ == '__main__':
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--warmup-step', type=int, default=10)
-    parser.add_argument('--milestones', nargs='+', type=int, default=[30],
+    parser.add_argument('--milestones', nargs='+', type=int, default=[15,30,45],
                         help='milestones for the learning rate decay')
     # training configs
     parser.add_argument('--resume', type=str, default=None, metavar='PATH')
     parser.add_argument('--evaluate', action='store_true',
                         help="evaluation only")
-    parser.add_argument('--epochs0', type=int, default=1)
-    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--epochs0', type=int, default=80)
+    parser.add_argument('--epochs', type=int, default=60)
     parser.add_argument('--eval_epoch', type=int, default=100)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--print-freq', type=int, default=200)
 
     # path   
     parser.add_argument('--data-dir', type=str, metavar='PATH',
-                        default='/data0/data_lzj/')
+                        default='/data1/swx/datasets')
     parser.add_argument('--logs-dir', type=str, metavar='PATH',
-                        default=osp.join('/data1/lzj_log/COPY'))
+                        default='/data1/swx/Project/logs/try_with_ETF')
 
       
     parser.add_argument('--test_folder', type=str, default='', help="test the models in a file")

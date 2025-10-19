@@ -8,23 +8,26 @@ from reid.utils.data.sampler import RandomMultipleGallerySampler
 from reid.utils.data import IterLoader
 import numpy as np
 
-def get_data(name, data_dir, height, width, batch_size, workers, num_instances, select_num=0):
+def get_data(cam_filter, data_dir, height, width, batch_size, workers, num_instances, name,select_num=0):
     # root = osp.join(data_dir, name)
     root = data_dir
     
-    dataset = datasets.create(name, root)
+    cam_id = int(cam_filter.split("cam")[-1])
+    cam_filter = cam_id
+    dataset = datasets.create(name, cam_filter,root)
     '''select some persons for training'''
     train_img_count = len(dataset.train)
-    if select_num > 0:
-        train = []
-        for instance in dataset.train:
-            if instance[1] < select_num:
-                # new_id=id_2_id[instance[1]]
-                train.append((instance[0], instance[1], instance[2], instance[3]))  #img_path, pid, camid, domain-id
+    num_classes = dataset.num_classes
+    # if select_num > 0:
+    #     train = []
+    #     for instance in dataset.train:
+    #         if instance[1] < select_num:
+    #             # new_id=id_2_id[instance[1]]
+    #             train.append((instance[0], instance[1], instance[2], instance[3]))  #img_path, pid, camid, domain-id
 
-        dataset.train = train
-        dataset.num_train_pids = select_num  # 更新训练集中身份的数量
-        train_img_count = len(train)  # 更新训练集中图像的数量
+    #     dataset.train = train
+    #     dataset.num_train_pids = select_num  # 更新训练集中身份的数量
+    #     train_img_count = len(train)  # 更新训练集中图像的数量
 
    
 
@@ -34,7 +37,6 @@ def get_data(name, data_dir, height, width, batch_size, workers, num_instances, 
     train_set = sorted(dataset.train)
 
     iters = int(len(train_set) / batch_size)
-    num_classes = dataset.num_train_pids
 
     train_transformer = T.Compose([
         T.Resize((height, width), interpolation=3),
@@ -57,6 +59,7 @@ def get_data(name, data_dir, height, width, batch_size, workers, num_instances, 
         sampler = RandomMultipleGallerySampler(train_set, num_instances)
     else:
         sampler = None
+    
 
 
     train_loader = IterLoader(
@@ -77,7 +80,7 @@ def get_data(name, data_dir, height, width, batch_size, workers, num_instances, 
 
     init_loader = DataLoader(Preprocessor(train_set, root=dataset.images_dir,transform=test_transformer),
                              batch_size=128, num_workers=workers,shuffle=False, pin_memory=True, drop_last=False)
-    return [dataset, num_classes, train_loader, test_loader, init_loader, name,train_img_count]
+    return [dataset, num_classes, train_loader, test_loader, init_loader, name+'cam_'+str(cam_filter), train_img_count]
 
 def get_test_loader(dataset, height, width, batch_size, workers, testset=None):
     normalizer = T.Normalize(mean=[0.485, 0.456, 0.406],
@@ -104,8 +107,6 @@ def build_data_loaders(cfg, training_set, testing_only_set, toy_num=0):
     # Create data loaders
     data_dir = cfg.data_dir
     height, width = (256, 128)
-    training_loaders = [get_data(name, data_dir, height, width, cfg.batch_size, cfg.workers,
-                                 cfg.num_instances, select_num=-1) for name in training_set]
-    testing_loaders = [get_data(name, data_dir, height, width, cfg.batch_size, cfg.workers,
-                                cfg.num_instances) for name in testing_only_set]
-    return training_loaders, testing_loaders
+    training_loaders = [get_data(cam_filter, data_dir, height, width, cfg.batch_size, cfg.workers,
+                                 cfg.num_instances, name = 'market1501',select_num=-1) for cam_filter in training_set]
+    return training_loaders, training_loaders
